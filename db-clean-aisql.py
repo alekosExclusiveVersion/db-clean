@@ -24,14 +24,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+MONITORING_REPO = Path(os.environ.get(
+    "MONITORING_REPO", "/Users/aleksei/Work/scripts/monitoring"))
+
+def _default_psa_app() -> str:
+    if os.name == "nt":
+        return os.environ.get(
+            "APPDATA", str(Path.home() / "AppData/Roaming")
+        ) + "/Parallels SQL Admin"
+    return "/Users/aleksei/Library/Application Support/Parallels SQL Admin"
+
+
 PSA_ROOT = Path(os.environ.get("PSA_REPO", "/Users/aleksei/Work/scripts/parallels-sql-admins"))
 B24_ROOT = Path(os.environ.get("B24_REPO", "/Users/aleksei/Work/ts-b24"))
-PSA_APP = Path(
-    os.environ.get(
-        "PSA_APP",
-        "/Users/aleksei/Library/Application Support/Parallels SQL Admin",
-    )
-)
+PSA_APP = Path(os.environ.get("PSA_APP", _default_psa_app()))
 AISQL_HOST = os.environ.get(
     "AISQL_HOST", r"aisql.tradesoft.corp\supportsql"
 )
@@ -39,23 +45,23 @@ SYSTEM_DBS = frozenset(
     ("master", "tempdb", "model", "msdb",
      "information_schema", "performance_schema", "mysql", "sys")
 )
-RETRY_MARKER = "/var/run/corp-db-clean.retry"
+RETRY_MARKER = Path(os.environ.get(
+    "DB_CLEAN_RETRY_MARKER", "/var/run/corp-db-clean.retry"))
 ROTATE_LINES = 500
 BANNER_MAX_NAMES = 6
 
 
 def set_retry() -> None:
     try:
-        p = Path(RETRY_MARKER)
-        if not p.exists():
-            p.touch()
+        if not RETRY_MARKER.exists():
+            RETRY_MARKER.touch()
     except OSError:
         pass
 
 
 def clear_retry() -> None:
     try:
-        Path(RETRY_MARKER).unlink()
+        RETRY_MARKER.unlink()
     except OSError:
         pass
 
@@ -81,6 +87,22 @@ def signal(signals: Path, event: str, msg: str) -> None:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}|{event}|{msg}\n")
     except OSError as ex:
         print(f"signal error: {ex}", file=sys.stderr)
+
+
+def notify_direct(event: str, msg: str) -> None:
+    """Шлёт событие в B24/Telegram напрямую (без macOS-агента corp-notify.sh).
+
+    Используется на Windows, где нет signal-файла и юзер-агента.
+    """
+    try:
+        sys.path.insert(0, str(MONITORING_REPO))
+        from notify import notify_all
+
+        title = "db-clean: " + event.removeprefix("db-clean.")
+        notify_all(title, msg)
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} notify {event}: {msg}")
+    except Exception as ex:
+        print(f"notify error {event}: {ex}", file=sys.stderr)
 
 
 def banner_list(names: list[str]) -> str:
@@ -134,11 +156,32 @@ def parse_candidate(name: str) -> list[int] | None:
     return ids or None
 
 
+def b24_env_safe() -> None:
+    """Прокидывает B24-секреты окружение, если B24_REPO/.env отсутствует.
+
+    macOS: .env (имеет приоритет в b24_client) — поведение не меняется.
+    Windows: секреты берутся из Credential Manager через notify.secret_get.
+    """
+    if (B24_ROOT / ".env").exists():
+        return
+    try:
+        sys.path.insert(0, str(MONITORING_REPO))
+        from notify import secret_get
+
+        if not os.environ.get("B24_BASE_URL"):
+            os.environ["B24_BASE_URL"] = secret_get("opencode.ts-b24.base-url")
+        if not os.environ.get("B24_WEBHOOK_TOKEN"):
+            os.environ["B24_WEBHOOK_TOKEN"] = secret_get("opencode.ts-b24.webhook-token")
+    except Exception as ex:
+        print(f"warning b24 secrets: {ex}", file=sys.stderr)
+
+
 def fetch_deals(ids: list[int]):
+    b24_env_safe()
     sys.path.insert(0, str(B24_ROOT / "scripts"))
     from b24_client import B24Client
 
-    client = B24Client()
+    client = B24Client(env_file=None)
     deals: dict[int, dict] = {}
     if ids:
         try:
@@ -177,6 +220,9 @@ def main() -> int:
         "DB_CLEAN_LOG", "/var/log/corp-db-clean.log"))
     ap.add_argument("--signals", default=os.environ.get(
         "DB_CLEAN_SIGNALS", "/var/run/corp-vpn-signals"))
+    ap.add_argument("--notify", action="store_true",
+                    help="дальше слать события в B24/Telegram напрямую "
+                         "(Windows, без corp-notify.sh)")
     args = ap.parse_args()
 
     commit = args.commit or os.environ.get("DB_CLEAN_COMMIT") == "1"
@@ -185,6 +231,12 @@ def main() -> int:
 
     log = Path(args.log)
     signals = Path(args.signals)
+    notify = args.notify or os.environ.get("DB_CLEAN_NOTIFY") == "1"
+
+    def emit(event: str, msg: str) -> None:
+        signal(signals, event, msg)
+        if notify:
+            notify_direct(event, msg)
 
     load_psa()
     mssql = get_mssql()
@@ -198,7 +250,7 @@ def main() -> int:
         log_line(log, f"FAIL aisql недоступен: {msg}")
         set_retry()
         if os.environ.get("DB_CLEAN_RETRY") != "1":
-            signal(signals, "db-clean.fail", f"aisql недоступен: {msg}")
+            emit("db-clean.fail", f"aisql недоступен: {msg}")
         return 2
     clear_retry()
 
@@ -257,10 +309,10 @@ def main() -> int:
 
     if not commit:
         if to_drop:
-            signal(signals, "db-clean.dryrun",
-                   f"к удалению {len(to_drop)} БД: {banner_list(names)}")
+            emit("db-clean.dryrun",
+                 f"к удалению {len(to_drop)} БД: {banner_list(names)}")
         else:
-            signal(signals, "db-clean.dryrun", "к удалению 0 БД")
+            emit("db-clean.dryrun", "к удалению 0 БД")
         print(summary)
         for n, d in to_drop:
             print(f"  would-drop {n} (deal {d})")
@@ -283,15 +335,15 @@ def main() -> int:
     log_line(log, f"SUMMARY removed={removed} errors={errors}")
 
     if errors:
-        signal(signals, "db-clean.fail",
-               f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}")
+        emit("db-clean.fail",
+             f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}")
         set_retry()
     elif removed:
-        signal(signals, "db-clean.ok",
-               f"удалено {removed} БД: {banner_list(names)}")
+        emit("db-clean.ok",
+             f"удалено {removed} БД: {banner_list(names)}")
         clear_retry()
     else:
-        signal(signals, "db-clean.ok", "удалено 0 БД")
+        emit("db-clean.ok", "удалено 0 БД")
         clear_retry()
 
     try:
