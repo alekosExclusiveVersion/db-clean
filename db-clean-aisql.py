@@ -232,10 +232,11 @@ def main() -> int:
     log = Path(args.log)
     signals = Path(args.signals)
     notify = args.notify or os.environ.get("DB_CLEAN_NOTIFY") == "1"
+    notify_on_delete = os.environ.get("DB_CLEAN_NOTIFY_ON_DELETE") == "1"
 
-    def emit(event: str, msg: str) -> None:
+    def emit(event: str, msg: str, *, send: bool = True) -> None:
         signal(signals, event, msg)
-        if notify:
+        if notify and send:
             notify_direct(event, msg)
 
     load_psa()
@@ -250,7 +251,8 @@ def main() -> int:
         log_line(log, f"FAIL aisql недоступен: {msg}")
         set_retry()
         if os.environ.get("DB_CLEAN_RETRY") != "1":
-            emit("db-clean.fail", f"aisql недоступен: {msg}")
+            emit("db-clean.fail", f"aisql недоступен: {msg}",
+                 send=not notify_on_delete)
         return 2
     clear_retry()
 
@@ -336,14 +338,15 @@ def main() -> int:
 
     if errors:
         emit("db-clean.fail",
-             f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}")
+             f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}",
+             send=not notify_on_delete)
         set_retry()
     elif removed:
         emit("db-clean.ok",
              f"удалено {removed} БД: {banner_list(names)}")
         clear_retry()
     else:
-        emit("db-clean.ok", "удалено 0 БД")
+        emit("db-clean.ok", "удалено 0 БД", send=not notify_on_delete)
         clear_retry()
 
     try:
