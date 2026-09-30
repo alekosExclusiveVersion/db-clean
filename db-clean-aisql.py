@@ -3,7 +3,10 @@
 
 Критерий удаления: имя БД вида имя_клиента_<id1>[_<id2>...] (каждая цифровая
 часть после подчёркивания — номер сделки). БД удаляется только когда ВСЕ
-указанные в имени сделки завершены (STAGE_SEMANTIC_ID='S' и CLOSED='Y').
+указанные в имени сделки завершены: CLOSED='Y' и STAGE_SEMANTIC_ID в
+TERMINAL_SEMANTICS (по умолчанию 'S' — успех и 'F' — провал/отказ; 'P' —
+в работе). Набор терминальных семантик переопределяется env DB_CLEAN_TERMINAL
+(через запятую) или флагом --only-success (только 'S').
 
 При недоступности aisql или ошибках удаления ставится retry-маркер
 (/var/run/corp-db-clean.retry); при успехе маркер снимается. Демон
@@ -18,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -47,8 +49,38 @@ SYSTEM_DBS = frozenset(
 )
 RETRY_MARKER = Path(os.environ.get(
     "DB_CLEAN_RETRY_MARKER", "/var/run/corp-db-clean.retry"))
+DEFAULT_TERMINAL_SEMANTICS = ("S", "F")
+SEMANTIC_LABELS = {"S": "успех", "F": "провал", "P": "в работе"}
+SUCCESS_ONLY_SEMANTICS = frozenset(("S",))
 ROTATE_LINES = 500
 BANNER_MAX_NAMES = 6
+
+
+def terminal_semantics(only_success: bool = False) -> frozenset[str]:
+    if only_success:
+        return SUCCESS_ONLY_SEMANTICS
+    raw = os.environ.get("DB_CLEAN_TERMINAL")
+    if not raw:
+        return frozenset(DEFAULT_TERMINAL_SEMANTICS)
+    values = frozenset(v.strip().upper() for v in raw.split(",") if v.strip())
+    return values or frozenset(DEFAULT_TERMINAL_SEMANTICS)
+
+
+def deal_finished(deal, terminal: frozenset[str]) -> bool:
+    if not deal or deal.get("CLOSED") != "Y":
+        return False
+    return deal.get("STAGE_SEMANTIC_ID") in terminal
+
+
+def deal_state(deal) -> str:
+    if not deal:
+        return "нет сделки"
+    semantic = deal.get("STAGE_SEMANTIC_ID")
+    return SEMANTIC_LABELS.get(semantic, semantic or "?")
+
+
+def deal_states(deals: dict, deal_ids: list[int]) -> str:
+    return ", ".join(f"{i} ({deal_state(deals.get(i))})" for i in deal_ids)
 
 
 def set_retry() -> None:
@@ -223,7 +255,12 @@ def main() -> int:
     ap.add_argument("--notify", action="store_true",
                     help="дальше слать события в B24/Telegram напрямую "
                          "(Windows, без corp-notify.sh)")
+    ap.add_argument("--only-success", action="store_true",
+                    help="удалять только по успешным сделкам "
+                         "(STAGE_SEMANTIC_ID='S'), без проваленных")
     args = ap.parse_args()
+
+    terminal = terminal_semantics(args.only_success)
 
     commit = args.commit or os.environ.get("DB_CLEAN_COMMIT") == "1"
     if args.dry_run:
@@ -242,7 +279,11 @@ def main() -> int:
     load_psa()
     mssql = get_mssql()
 
-    log_line(log, "=== START commit=%d host=%s ===" % (int(commit), args.host))
+    log_line(
+        log,
+        f"=== START commit={int(commit)} host={args.host} "
+        f"terminal={','.join(sorted(terminal))} ===",
+    )
 
     try:
         databases = list_databases(mssql, args.host)
@@ -282,22 +323,22 @@ def main() -> int:
             log_line(log, f"SKIPPED {name} deal={deal_ids} нет сделки в Б24 для {missing}")
             continue
 
-        unfinished = [
-            i for i in deal_ids
-            if not (deals[i].get("STAGE_SEMANTIC_ID") == "S"
-                    and deals[i].get("CLOSED") == "Y")
-        ]
+        unfinished = [i for i in deal_ids if not deal_finished(deals[i], terminal)]
         if unfinished:
-            skipped.append((name, deal_ids, f"не завершены {unfinished}"))
+            states = deal_states(deals, unfinished)
+            skipped.append((name, deal_ids, f"не завершены: {states}"))
             log_line(
                 log,
-                f"SKIPPED {name} deal={deal_ids} "
-                f"не завершены {unfinished}",
+                f"SKIPPED {name} deal={deal_ids} не завершены: {states}",
             )
             continue
 
         to_drop.append((name, deal_ids))
-        log_line(log, f"CANDIDATE {name} deal={deal_ids} все сделки завершены")
+        log_line(
+            log,
+            f"CANDIDATE {name} deal={deal_ids} "
+            f"завершены: {deal_states(deals, deal_ids)}",
+        )
 
     if args.limit > 0:
         to_drop = to_drop[:args.limit]
