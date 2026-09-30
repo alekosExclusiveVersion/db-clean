@@ -188,6 +188,59 @@ def parse_candidate(name: str) -> list[int] | None:
     return ids or None
 
 
+def deal_candidates(databases: list[str]) -> dict[str, list[int]]:
+    """Оставить только БД, чьё имя разбирается как клиент_<id сделок>."""
+    candidates: dict[str, list[int]] = {}
+    for name in databases:
+        if name in SYSTEM_DBS:
+            continue
+        deal_ids = parse_candidate(name)
+        if deal_ids:
+            candidates[name] = deal_ids
+    return candidates
+
+
+def deal_id_list(candidates: dict[str, list[int]]) -> list[int]:
+    """Номера сделок по всем кандидатам, без повторов, в порядке появления."""
+    ids: list[int] = []
+    for deal_ids in candidates.values():
+        for i in deal_ids:
+            if i not in ids:
+                ids.append(i)
+    return ids
+
+
+def collect_candidates(
+    candidates: dict[str, list[int]],
+    deals: dict[int, dict],
+    terminal: frozenset[str],
+) -> tuple[list[tuple[str, list[int]]], list[tuple[str, list[int], str]]]:
+    """Разделить кандидатов на удаляемые и пропущенные с причиной пропуска.
+
+    deals — сделки Б24 по ID; отсутствующий ID означает «сделки нет».
+    Причины в returned skipped совпадают с текстом строк SKIPPED в логе.
+    """
+    to_drop: list[tuple[str, list[int]]] = []
+    skipped: list[tuple[str, list[int], str]] = []
+    for name in sorted(candidates):
+        deal_ids = candidates[name]
+
+        missing = [i for i in deal_ids if deals.get(i) is None]
+        if missing:
+            skipped.append((name, deal_ids, f"нет сделки в Б24 для {missing}"))
+            continue
+
+        unfinished = [i for i in deal_ids if not deal_finished(deals[i], terminal)]
+        if unfinished:
+            skipped.append(
+                (name, deal_ids, f"не завершены: {deal_states(deals, unfinished)}")
+            )
+            continue
+
+        to_drop.append((name, deal_ids))
+    return to_drop, skipped
+
+
 def b24_env_safe() -> None:
     """Прокидывает B24-секреты окружение, если B24_REPO/.env отсутствует.
 
@@ -297,48 +350,22 @@ def main() -> int:
         return 2
     clear_retry()
 
-    candidates: dict[str, list[int]] = {}
-    for name in databases:
-        if name in SYSTEM_DBS:
-            continue
-        deal_ids = parse_candidate(name)
-        if deal_ids:
-            candidates[name] = deal_ids
-
-    ids: list[int] = []
-    for deal_ids in candidates.values():
-        for i in deal_ids:
-            if i not in ids:
-                ids.append(i)
+    candidates = deal_candidates(databases)
+    ids = deal_id_list(candidates)
     deals = fetch_deals(ids) if ids else {}
 
-    to_drop: list[tuple[str, list[int]]] = []
-    skipped: list[tuple[str, list[int], str]] = []
+    to_drop, skipped = collect_candidates(candidates, deals, terminal)
+    reasons = {name: reason for name, _ids, reason in skipped}
     for name in sorted(candidates):
         deal_ids = candidates[name]
-
-        missing = [i for i in deal_ids if deals.get(i) is None]
-        if missing:
-            skipped.append((name, deal_ids, f"нет сделки в Б24 для {missing}"))
-            log_line(log, f"SKIPPED {name} deal={deal_ids} нет сделки в Б24 для {missing}")
-            continue
-
-        unfinished = [i for i in deal_ids if not deal_finished(deals[i], terminal)]
-        if unfinished:
-            states = deal_states(deals, unfinished)
-            skipped.append((name, deal_ids, f"не завершены: {states}"))
+        if name in reasons:
+            log_line(log, f"SKIPPED {name} deal={deal_ids} {reasons[name]}")
+        else:
             log_line(
                 log,
-                f"SKIPPED {name} deal={deal_ids} не завершены: {states}",
+                f"CANDIDATE {name} deal={deal_ids} "
+                f"завершены: {deal_states(deals, deal_ids)}",
             )
-            continue
-
-        to_drop.append((name, deal_ids))
-        log_line(
-            log,
-            f"CANDIDATE {name} deal={deal_ids} "
-            f"завершены: {deal_states(deals, deal_ids)}",
-        )
 
     if args.limit > 0:
         to_drop = to_drop[:args.limit]

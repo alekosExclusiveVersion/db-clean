@@ -13,7 +13,7 @@ DB_CLEAN_PLIST="/Library/LaunchDaemons/$DB_CLEAN_LABEL.plist"
 DB_CLEAN_RETRY_PLIST="/Library/LaunchDaemons/$DB_CLEAN_RETRY_LABEL.plist"
 DB_CLEAN_SCRIPT="/usr/local/sbin/corp-db-clean.sh"
 DB_CLEAN_RETRY_SCRIPT="/usr/local/sbin/db-clean-retry.sh"
-DB_CLEAN_PY="/usr/local/sbin/db-clean-aisql.py"
+DB_CLEAN_PY="/usr/local/sbin/db_clean.py"
 DB_CLEAN_LOG="/var/log/corp-db-clean.log"
 
 echo "==> Остановка и удаление retry-демона (corp-db-clean-retry)..."
@@ -27,7 +27,7 @@ echo "==> Остановка и удаление демона очистки Б�
 if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
   launchctl unload "$DB_CLEAN_PLIST" 2>/dev/null || true
 fi
-rm -f "$DB_CLEAN_PLIST" "$DB_CLEAN_SCRIPT" "$DB_CLEAN_PY"
+rm -f "$DB_CLEAN_PLIST" "$DB_CLEAN_SCRIPT" "$DB_CLEAN_PY" /usr/local/sbin/db-clean-aisql.py
 rm -f "$DB_CLEAN_LOG" "${DB_CLEAN_LOG}.stdout.log" "${DB_CLEAN_LOG}.stderr.log"
 rm -f "$DB_CLEAN_RETRY_LOG" "${DB_CLEAN_RETRY_LOG}.stdout.log" "${DB_CLEAN_RETRY_LOG}.stderr.log"
 rm -f /var/run/corp-db-clean.retry

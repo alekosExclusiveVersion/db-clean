@@ -65,9 +65,10 @@ Browser 1434); реальная проверка — dry-run скрипта.
 
 ## Проверка
 
-- `python3 -m py_compile db-clean-aisql.py`
-- `DB_CLEAN_LOG=/tmp/db-clean.log python3 db-clean-aisql.py --dry-run`
+- `python3 -m py_compile db_clean.py`
+- `python3 -m unittest discover -s tests -v` — тесты отбора кандидатов, без сети
+- `DB_CLEAN_LOG=/tmp/db-clean.log python3 db_clean.py --dry-run`
   (показать кандидатов без удаления)
-- `python3 db-clean-aisql.py --dry-run --only-success` — проверка старого
+- `python3 db_clean.py --dry-run --only-success` — проверка старого
   критерия (только успешные сделки)
 - Сигналы: `tail /var/run/corp-vpn-signals`
