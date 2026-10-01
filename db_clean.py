@@ -411,7 +411,7 @@ def main() -> int:
         set_retry()
     elif removed:
         emit("db-clean.ok",
-             f"удалено {removed} БД: {banner_list(names)}")
+             f"aisql server очищен, удалены бд: {banner_list(names)}")
         clear_retry()
     else:
         emit("db-clean.ok", "удалено 0 БД", send=not notify_on_delete)
