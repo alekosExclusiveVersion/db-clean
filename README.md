@@ -37,10 +37,14 @@ Retry-демон каждые 15 минут пробует снова (чере�
 недоступности не дублируют сигнал `db-clean.fail`. Как только очистка прошла
 успешно — маркер снимается, retry-демон останавливается (маркера нет).
 
-На Windows автоматического retry нет: задача `tradesoft-db-clean` запускает
-основной прогон ежедневно в 21:00. Переменная `DB_CLEAN_NOTIFY_ON_DELETE=1`
-разрешает B24/Telegram-уведомления только при фактическом удалении БД; ошибки
-и пустые результаты сохраняются в логе.
+На Windows retry есть: задача `tradesoft-db-clean-retry` (каждые 30 мин,
+только при наличии сети) через `Invoke-DbCleanRetry.ps1` (в
+`monitoring/windows/`) проверяет маркер `db-clean.retry` и запускает
+`db_clean.py --commit --notify` в тихом режиме (`DB_CLEAN_RETRY=1`).
+Перед коннектом идёт предпроверка DNS/ping (`FAIL precheck ...` в логе —
+VPN/DNS, а не SQL). `FAIL` уведомляется в B24/Telegram всегда; переменная
+`DB_CLEAN_NOTIFY_ON_DELETE=1` ограничивает только `ok`/`dryrun`.
+Отключение предпроверки: `DB_CLEAN_SKIP_PRECHECK=1`.
 
 ## Установка / удаление
 

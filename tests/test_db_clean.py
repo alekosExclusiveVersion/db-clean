@@ -186,5 +186,20 @@ class BannerList(unittest.TestCase):
         self.assertEqual(d.one_line("a\r\n  b\tc"), "a b c")
 
 
+class PrecheckNetwork(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("DB_CLEAN_SKIP_PRECHECK", None)
+
+    def test_skip_env_disables(self):
+        os.environ["DB_CLEAN_SKIP_PRECHECK"] = "1"
+        self.assertIsNone(d.precheck_network(r"aisql.tradesoft.corp\supportsql"))
+
+    def test_bad_dns_returns_reason(self):
+        os.environ.pop("DB_CLEAN_SKIP_PRECHECK", None)
+        err = d.precheck_network(r"nonexistent-host-xyz123.invalid\supportsql")
+        self.assertIsNotNone(err)
+        self.assertIn("DNS", err)
+
+
 if __name__ == "__main__":
     unittest.main()

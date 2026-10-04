@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import socket
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -146,6 +149,40 @@ def banner_list(names: list[str]) -> str:
 
 def one_line(value) -> str:
     return " ".join(str(value).split())
+
+
+def precheck_network(host: str) -> str | None:
+    """Быстрая предпроверка сети до SQL-хоста, без долгого TDS-таймаута.
+
+    Возвращает None если сеть в порядке, иначе строку причины:
+    DNS не резолвится (VPN/корп.DNS недоступен) либо нет ping
+    (нет маршрута в корпсеть). Отключается env DB_CLEAN_SKIP_PRECHECK=1.
+    """
+    if os.environ.get("DB_CLEAN_SKIP_PRECHECK") == "1":
+        return None
+    server = host.split("\\")[0].split(",")[0].strip() or host
+    try:
+        ip = socket.gethostbyname(server)
+    except socket.gaierror:
+        return f"DNS {server} не резолвится (VPN/корп.DNS недоступен)"
+    except Exception as ex:
+        return f"DNS {server}: {one_line(ex)}"
+    ping = shutil.which("ping")
+    if not ping:
+        return None
+    try:
+        if os.name == "nt":
+            cmd = [ping, "-n", "1", "-w", "1000", server]
+        else:
+            cmd = [ping, "-c", "1", "-W", "1", server]
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5,
+        )
+        if res.returncode != 0:
+            return f"нет ping до {server} ({ip}) — нет маршрута/VPN down"
+    except Exception as ex:
+        return f"ping {server} ({ip}): {one_line(ex)}"
+    return None
 
 
 def load_psa() -> None:
@@ -339,14 +376,27 @@ def main() -> int:
     )
 
     try:
+        precheck_err = precheck_network(args.host)
+    except Exception as ex:
+        precheck_err = one_line(ex)
+    if precheck_err:
+        log_line(log, f"FAIL precheck aisql недоступен: {precheck_err}")
+        set_retry()
+        if os.environ.get("DB_CLEAN_RETRY") != "1":
+            # FAIL уведомляем всегда, даже при DB_CLEAN_NOTIFY_ON_DELETE=1:
+            # иначе обрыв сети даёт тишину до следующих суток.
+            emit("db-clean.fail", f"aisql недоступен (precheck): {precheck_err}")
+        return 2
+
+    try:
         databases = list_databases(mssql, args.host)
     except Exception as ex:
         msg = one_line(ex)
         log_line(log, f"FAIL aisql недоступен: {msg}")
         set_retry()
         if os.environ.get("DB_CLEAN_RETRY") != "1":
-            emit("db-clean.fail", f"aisql недоступен: {msg}",
-                 send=not notify_on_delete)
+            # FAIL уведомляем всегда, даже при DB_CLEAN_NOTIFY_ON_DELETE=1.
+            emit("db-clean.fail", f"aisql недоступен: {msg}")
         return 2
     clear_retry()
 
@@ -406,8 +456,7 @@ def main() -> int:
 
     if errors:
         emit("db-clean.fail",
-             f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}",
-             send=not notify_on_delete)
+             f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}")
         set_retry()
     elif removed:
         emit("db-clean.ok",
