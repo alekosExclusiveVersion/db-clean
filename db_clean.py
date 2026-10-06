@@ -14,7 +14,8 @@ corp-db-clean-retry каждые 15 мин повторяет очистку, п
 (тихий режим DB_CLEAN_RETRY=1: повторные недоступности не дублируют сигнал).
 
 Режимы: --dry-run (по умолчанию) показывает кандидатов, --commit удаляет.
-Юзер-агент corp-notify.sh шлёт события db-clean.* в macOS-баннер, B24 и Telegram.
+Уведомления: в B24/Telegram уходит только фактическое удаление БД
+(db-clean.ok с removed>0); FAIL/dryrun/нули — в лог и Windows-тост.
 """
 
 from __future__ import annotations
@@ -125,9 +126,9 @@ def signal(signals: Path, event: str, msg: str) -> None:
 
 
 def notify_direct(event: str, msg: str) -> None:
-    """Шлёт событие в B24/Telegram напрямую (без macOS-агента corp-notify.sh).
+    """Продакшн-уведомление в B24/Telegram напрямую (без corp-notify.sh).
 
-    Используется на Windows, где нет signal-файла и юзер-агента.
+    Только фактическое удаление БД. Остальное — в лог и Windows-тост.
     """
     try:
         sys.path.insert(0, str(MONITORING_REPO))
@@ -138,6 +139,21 @@ def notify_direct(event: str, msg: str) -> None:
         print(f"{datetime.now():%Y-%m-%d %H:%M:%S} notify {event}: {msg}")
     except Exception as ex:
         print(f"notify error {event}: {ex}", file=sys.stderr)
+
+
+def notify_windows(event: str, msg: str) -> None:
+    """Локальное уведомление Windows-тостом (без B24/Telegram)."""
+    if os.name != "nt":
+        return
+    try:
+        sys.path.insert(0, str(MONITORING_REPO))
+        from notify import send_windows_toast
+
+        title = "db-clean: " + event.removeprefix("db-clean.")
+        send_windows_toast(title, msg)
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} windows {event}: {msg}")
+    except Exception as ex:
+        print(f"windows notify error {event}: {ex}", file=sys.stderr)
 
 
 def banner_list(names: list[str]) -> str:
@@ -343,8 +359,8 @@ def main() -> int:
     ap.add_argument("--signals", default=os.environ.get(
         "DB_CLEAN_SIGNALS", "/var/run/corp-vpn-signals"))
     ap.add_argument("--notify", action="store_true",
-                    help="дальше слать события в B24/Telegram напрямую "
-                         "(Windows, без corp-notify.sh)")
+                     help="продакшн-уведомления (фактическое удаление) слать "
+                          "в B24/Telegram напрямую (Windows, без corp-notify.sh)")
     ap.add_argument("--only-success", action="store_true",
                     help="удалять только по успешным сделкам "
                          "(STAGE_SEMANTIC_ID='S'), без проваленных")
@@ -359,12 +375,18 @@ def main() -> int:
     log = Path(args.log)
     signals = Path(args.signals)
     notify = args.notify or os.environ.get("DB_CLEAN_NOTIFY") == "1"
-    notify_on_delete = os.environ.get("DB_CLEAN_NOTIFY_ON_DELETE") == "1"
 
     def emit(event: str, msg: str, *, send: bool = True) -> None:
+        # Продакшн-ветка: только фактическое удаление идёт в B24/Telegram.
         signal(signals, event, msg)
         if notify and send:
             notify_direct(event, msg)
+        notify_windows(event, msg)
+
+    def emit_local(event: str, msg: str) -> None:
+        # Непродакшн: сигнал для истории + Windows-тост, без B24/Telegram.
+        signal(signals, event, msg)
+        notify_windows(event, msg)
 
     load_psa()
     mssql = get_mssql()
@@ -383,9 +405,9 @@ def main() -> int:
         log_line(log, f"FAIL precheck aisql недоступен: {precheck_err}")
         set_retry()
         if os.environ.get("DB_CLEAN_RETRY") != "1":
-            # FAIL уведомляем всегда, даже при DB_CLEAN_NOTIFY_ON_DELETE=1:
-            # иначе обрыв сети даёт тишину до следующих суток.
-            emit("db-clean.fail", f"aisql недоступен (precheck): {precheck_err}")
+            # FAIL — только лог и Windows-тост, без B24/Telegram.
+            emit_local("db-clean.fail",
+                       f"aisql недоступен (precheck): {precheck_err}")
         return 2
 
     try:
@@ -395,8 +417,8 @@ def main() -> int:
         log_line(log, f"FAIL aisql недоступен: {msg}")
         set_retry()
         if os.environ.get("DB_CLEAN_RETRY") != "1":
-            # FAIL уведомляем всегда, даже при DB_CLEAN_NOTIFY_ON_DELETE=1.
-            emit("db-clean.fail", f"aisql недоступен: {msg}")
+            # FAIL — только лог и Windows-тост, без B24/Telegram.
+            emit_local("db-clean.fail", f"aisql недоступен: {msg}")
         return 2
     clear_retry()
 
@@ -429,10 +451,12 @@ def main() -> int:
 
     if not commit:
         if to_drop:
-            emit("db-clean.dryrun",
-                 f"к удалению {len(to_drop)} БД: {banner_list(names)}")
+            # Dry-run — не продакшн: без B24/Telegram.
+            emit_local("db-clean.dryrun",
+                       f"к удалению {len(to_drop)} БД: {banner_list(names)}")
+        # Нулевой dry-run — только лог/консоль, без сигнала и уведомления.
         else:
-            emit("db-clean.dryrun", "к удалению 0 БД")
+            log_line(log, "DRYRUN пусто: к удалению 0 БД")
         print(summary)
         for n, d in to_drop:
             print(f"  would-drop {n} (deal {d})")
@@ -455,15 +479,19 @@ def main() -> int:
     log_line(log, f"SUMMARY removed={removed} errors={errors}")
 
     if errors:
-        emit("db-clean.fail",
-             f"удалено {removed}, ошибок {errors}: {banner_list(failed_names)}")
+        # Ошибки удаления — только лог и Windows-тост, без B24/Telegram.
+        emit_local("db-clean.fail",
+                   f"удалено {removed}, ошибок {errors}: "
+                   f"{banner_list(failed_names)}")
         set_retry()
     elif removed:
+        # Единственная продакшн-ветка: B24/Telegram (+ Windows-тост внутри emit).
         emit("db-clean.ok",
              f"aisql server очищен, удалены бд: {banner_list(names)}")
         clear_retry()
     else:
-        emit("db-clean.ok", "удалено 0 БД", send=not notify_on_delete)
+        # Нулевой результат — только лог, без сигнала и уведомления.
+        log_line(log, "OK пусто: удалено 0 БД")
         clear_retry()
 
     try:

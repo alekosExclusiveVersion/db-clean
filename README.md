@@ -42,8 +42,8 @@ Retry-демон каждые 15 минут пробует снова (чере�
 `monitoring/windows/`) проверяет маркер `db-clean.retry` и запускает
 `db_clean.py --commit --notify` в тихом режиме (`DB_CLEAN_RETRY=1`).
 Перед коннектом идёт предпроверка DNS/ping (`FAIL precheck ...` в логе —
-VPN/DNS, а не SQL). `FAIL` уведомляется в B24/Telegram всегда; переменная
-`DB_CLEAN_NOTIFY_ON_DELETE=1` ограничивает только `ok`/`dryrun`.
+VPN/DNS, а не SQL). В B24/Telegram уходит только фактическое удаление БД;
+`FAIL`, `dryrun` и нулевые результаты — в лог и Windows-тост.
 Отключение предпроверки: `DB_CLEAN_SKIP_PRECHECK=1`.
 
 ## Установка / удаление
