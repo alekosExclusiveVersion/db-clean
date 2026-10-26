@@ -13,6 +13,10 @@ TERMINAL_SEMANTICS (по умолчанию 'S' — успех и 'F' — про
 corp-db-clean-retry каждые 15 мин повторяет очистку, пока маркер существует
 (тихий режим DB_CLEAN_RETRY=1: повторные недоступности не дублируют сигнал).
 
+Серверы: mssql-хост (--host, по умолчанию aisql) + все pgsql-серверы из
+реестра PSA (движок pgsql; список переопределяется env
+DB_CLEAN_PGSQL_HOSTS через запятую, формат host[:port]).
+
 Режимы: --dry-run (по умолчанию) показывает кандидатов, --commit удаляет.
 Уведомления: в B24/Telegram уходит только фактическое удаление БД
 (db-clean.ok с removed>0); FAIL/dryrun/нули — в лог и Windows-тост.
@@ -47,8 +51,10 @@ PSA_APP = Path(os.environ.get("PSA_APP", _default_psa_app()))
 AISQL_HOST = os.environ.get(
     "AISQL_HOST", r"aisql.tradesoft.corp\supportsql"
 )
+ENGINE_MSSQL = "mssql"
+ENGINE_PGSQL = "pgsql"
 SYSTEM_DBS = frozenset(
-    ("master", "tempdb", "model", "msdb",
+    ("master", "tempdb", "model", "msdb", "postgres", "template0", "template1",
      "information_schema", "performance_schema", "mysql", "sys")
 )
 RETRY_MARKER = Path(os.environ.get(
@@ -163,12 +169,26 @@ def banner_list(names: list[str]) -> str:
     return ", ".join(head) + f", и ещё {len(names) - BANNER_MAX_NAMES}"
 
 
+def ok_message(stats: dict[str, dict]) -> str:
+    """Ok-уведомление: ✅ и списком удалённые БД под каждым сервером."""
+    lines = ["✅ Очистка БД выполнена"]
+    for host, st in stats.items():
+        if not st["removed"]:
+            continue
+        lines.append(f"{host}:")
+        shown = st["names"][:BANNER_MAX_NAMES]
+        lines.extend(f"• {name}" for name in shown)
+        if len(st["names"]) > BANNER_MAX_NAMES:
+            lines.append(f"• … и ещё {len(st['names']) - BANNER_MAX_NAMES}")
+    return "\n".join(lines)
+
+
 def one_line(value) -> str:
     return " ".join(str(value).split())
 
 
 def precheck_network(host: str) -> str | None:
-    """Быстрая предпроверка сети до SQL-хоста, без долгого TDS-таймаута.
+    """Быстрая предпроверка сети до SQL-хоста, без долгого SQL-таймаута.
 
     Возвращает None если сеть в порядке, иначе строку причины:
     DNS не резолвится (VPN/корп.DNS недоступен) либо нет ping
@@ -177,6 +197,10 @@ def precheck_network(host: str) -> str | None:
     if os.environ.get("DB_CLEAN_SKIP_PRECHECK") == "1":
         return None
     server = host.split("\\")[0].split(",")[0].strip() or host
+    if ":" in server:
+        head, _, tail = server.rpartition(":")
+        if tail.isdigit() and head:
+            server = head
     try:
         ip = socket.gethostbyname(server)
     except socket.gaierror:
@@ -222,8 +246,99 @@ def get_mssql():
     return mssql
 
 
-def list_databases(client, host: str) -> list[str]:
-    rows = client.query(host, "SELECT name FROM sys.databases")
+def get_pgsql():
+    from common.pgsql_client import pgsql
+
+    return pgsql
+
+
+def parse_host_list(raw: str | None) -> list[str] | None:
+    """Разбор списка хостов host[:port] через запятую.
+
+    Возвращает None когда значение env не задано (разрешить обнаружение
+    по реестру), [] когда очистку pgsql нужно пропустить (пусто/off/none).
+    """
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in ("off", "none", "0"):
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def list_pgsql_host_keys() -> list[str]:
+    """Pgsql-хосты реестра PSA (engine=pgsql) в формате host[:port]."""
+    from common.server_registry import registry
+
+    out: list[str] = []
+    for spec in registry.load():
+        if spec.engine != ENGINE_PGSQL:
+            continue
+        host_key = spec.host_key()
+        if host_key not in out:
+            out.append(host_key)
+    return out
+
+
+def pgsql_targets() -> list[str]:
+    """Список pgsql-хостов для очистки.
+
+    Приоритет: DB_CLEAN_SKIP_PGSQL=1 → пропустить; DB_CLEAN_PGSQL_HOSTS
+    (список через запятую, off/none = пропустить) → использовать его;
+    иначе — все pgsql-серверы реестра PSA.
+    """
+    if os.environ.get("DB_CLEAN_SKIP_PGSQL") == "1":
+        return []
+    configured = parse_host_list(os.environ.get("DB_CLEAN_PGSQL_HOSTS"))
+    if configured is not None:
+        return configured
+    return list_pgsql_host_keys()
+
+
+def drop_database(client, engine: str, host: str, name: str) -> None:
+    """DROP DATABASE: pgsql требует autocommit (нет transaction block)."""
+    if engine != ENGINE_PGSQL:
+        client.drop_database(host, name)
+        return
+
+    import psycopg
+
+    from common.server_registry import registry
+
+    user, password, real_host, port = registry.credentials_for(host)
+    conn = psycopg.connect(
+        host=real_host, port=port, user=user, password=password,
+        dbname="postgres", autocommit=True,
+        connect_timeout=10,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pid FROM pg_stat_activity WHERE datname = %s",
+                (name,),
+            )
+            for row in cur.fetchall() or []:
+                pid = row.get("pid") if isinstance(row, dict) else row[0]
+                if pid:
+                    try:
+                        cur.execute(
+                            "SELECT pg_terminate_backend(%s)", (int(pid),)
+                        )
+                    except Exception:
+                        pass
+            cur.execute(f'DROP DATABASE "{name}"')
+    finally:
+        conn.close()
+
+
+def engine_list_sql(engine: str) -> str:
+    if engine == ENGINE_PGSQL:
+        return "SELECT datname AS name FROM pg_database"
+    return "SELECT name FROM sys.databases"
+
+
+def list_databases(client, engine: str, host: str) -> list[str]:
+    rows = client.query(host, engine_list_sql(engine))
     return sorted(r.get("name") for r in rows if r.get("name"))
 
 
@@ -241,11 +356,24 @@ def parse_candidate(name: str) -> list[int] | None:
     return ids or None
 
 
+def excluded_prefixes() -> tuple[str, ...]:
+    """Префиксы имён БД, которые не подлежат очистке (env DB_CLEAN_EXCLUDE_PREFIXES)."""
+    raw = os.environ.get("DB_CLEAN_EXCLUDE_PREFIXES", "priem")
+    return tuple(
+        p.strip().lower().rstrip(".")
+        for p in raw.split(",")
+        if p.strip()
+    )
+
+
 def deal_candidates(databases: list[str]) -> dict[str, list[int]]:
     """Оставить только БД, чьё имя разбирается как клиент_<id сделок>."""
+    prefixes = excluded_prefixes()
     candidates: dict[str, list[int]] = {}
     for name in databases:
         if name in SYSTEM_DBS:
+            continue
+        if any(name.lower().startswith(p) for p in prefixes):
             continue
         deal_ids = parse_candidate(name)
         if deal_ids:
@@ -267,11 +395,14 @@ def collect_candidates(
     candidates: dict[str, list[int]],
     deals: dict[int, dict],
     terminal: frozenset[str],
+    allow_missing: bool = False,
 ) -> tuple[list[tuple[str, list[int]]], list[tuple[str, list[int], str]]]:
     """Разделить кандидатов на удаляемые и пропущенные с причиной пропуска.
 
     deals — сделки Б24 по ID; отсутствующий ID означает «сделки нет».
     Причины в returned skipped совпадают с текстом строк SKIPPED в логе.
+    allow_missing=True — БД с не найденными сделками уходит в to_drop
+    (без него — fail-closed пропуск).
     """
     to_drop: list[tuple[str, list[int]]] = []
     skipped: list[tuple[str, list[int], str]] = []
@@ -280,6 +411,9 @@ def collect_candidates(
 
         missing = [i for i in deal_ids if deals.get(i) is None]
         if missing:
+            if allow_missing:
+                to_drop.append((name, deal_ids))
+                continue
             skipped.append((name, deal_ids, f"нет сделки в Б24 для {missing}"))
             continue
 
@@ -353,7 +487,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="только показать")
     ap.add_argument("--host", default=AISQL_HOST, help="хост aisql")
     ap.add_argument("--limit", type=int, default=0,
-                    help="максимум БД к обработке (0 = все)")
+                    help="максимум БД к обработке на одном сервере (0 = все)")
     ap.add_argument("--log", default=os.environ.get(
         "DB_CLEAN_LOG", "/var/log/corp-db-clean.log"))
     ap.add_argument("--signals", default=os.environ.get(
@@ -364,6 +498,9 @@ def main() -> int:
     ap.add_argument("--only-success", action="store_true",
                     help="удалять только по успешным сделкам "
                          "(STAGE_SEMANTIC_ID='S'), без проваленных")
+    ap.add_argument("--delete-missing", action="store_true",
+                    help="удалять БД, чьи сделки не найдены в Б24 "
+                         "(вместо fail-closed пропуска)")
     args = ap.parse_args()
 
     terminal = terminal_semantics(args.only_success)
@@ -388,117 +525,182 @@ def main() -> int:
         signal(signals, event, msg)
         notify_windows(event, msg)
 
+    stats: dict[str, dict] = {}
+
+    def remember(host: str, *, removed: int, errors: int, names: list[str],
+                 failed: list[str]) -> None:
+        stats[host] = {"removed": removed, "errors": errors,
+                       "names": names, "failed": failed}
+
     load_psa()
-    mssql = get_mssql()
+    try:
+        targets: list[tuple[str, str]] = [(ENGINE_MSSQL, args.host)]
+        seen_hosts = {args.host}
+        for host_key in pgsql_targets():
+            if host_key not in seen_hosts:
+                targets.append((ENGINE_PGSQL, host_key))
+                seen_hosts.add(host_key)
+    except Exception as ex:
+        msg = one_line(ex)
+        log_line(log, f"FAIL сбор pgsql-таргетов из реестра PSA: {msg}")
+        set_retry()
+        emit_local("db-clean.fail",
+                   f"реестр PSA недоступен (таргеты): {msg}")
+        return 2
+
+    clients = {ENGINE_MSSQL: get_mssql(), ENGINE_PGSQL: get_pgsql()}
 
     log_line(
         log,
-        f"=== START commit={int(commit)} host={args.host} "
+        f"=== START commit={int(commit)} "
+        f"hosts={[h for _e, h in targets]} "
         f"terminal={','.join(sorted(terminal))} ===",
     )
 
-    try:
-        precheck_err = precheck_network(args.host)
-    except Exception as ex:
-        precheck_err = one_line(ex)
-    if precheck_err:
-        log_line(log, f"FAIL precheck aisql недоступен: {precheck_err}")
-        set_retry()
-        if os.environ.get("DB_CLEAN_RETRY") != "1":
-            # FAIL — только лог и Windows-тост, без B24/Telegram.
-            emit_local("db-clean.fail",
-                       f"aisql недоступен (precheck): {precheck_err}")
-        return 2
-
-    try:
-        databases = list_databases(mssql, args.host)
-    except Exception as ex:
-        msg = one_line(ex)
-        log_line(log, f"FAIL aisql недоступен: {msg}")
-        set_retry()
-        if os.environ.get("DB_CLEAN_RETRY") != "1":
-            # FAIL — только лог и Windows-тост, без B24/Telegram.
-            emit_local("db-clean.fail", f"aisql недоступен: {msg}")
-        return 2
-    clear_retry()
-
-    candidates = deal_candidates(databases)
-    ids = deal_id_list(candidates)
-    deals = fetch_deals(ids) if ids else {}
-
-    to_drop, skipped = collect_candidates(candidates, deals, terminal)
-    reasons = {name: reason for name, _ids, reason in skipped}
-    for name in sorted(candidates):
-        deal_ids = candidates[name]
-        if name in reasons:
-            log_line(log, f"SKIPPED {name} deal={deal_ids} {reasons[name]}")
-        else:
-            log_line(
-                log,
-                f"CANDIDATE {name} deal={deal_ids} "
-                f"завершены: {deal_states(deals, deal_ids)}",
-            )
-
-    if args.limit > 0:
-        to_drop = to_drop[:args.limit]
-
-    names = [n for n, _ in to_drop]
-    summary = (
-        f"SUMMARY candidates={len(candidates)} to_drop={len(to_drop)} "
-        f"skipped={len(skipped)} dry_run={int(not commit)}"
-    )
-    log_line(log, summary)
-
-    if not commit:
-        if to_drop:
-            # Dry-run — не продакшн: без B24/Telegram.
-            emit_local("db-clean.dryrun",
-                       f"к удалению {len(to_drop)} БД: {banner_list(names)}")
-        # Нулевой dry-run — только лог/консоль, без сигнала и уведомления.
-        else:
-            log_line(log, "DRYRUN пусто: к удалению 0 БД")
-        print(summary)
-        for n, d in to_drop:
-            print(f"  would-drop {n} (deal {d})")
-        return 0
-
-    removed = 0
-    errors = 0
-    failed_names: list[str] = []
-    for name, deal_ids in to_drop:
+    # Шаг 1: precheck + список БД по каждому серверу.
+    reachable: list[tuple[str, str, dict[str, list[int]]]] = []
+    unreachable: list[tuple[str, str, str]] = []
+    for engine, host in targets:
         try:
-            mssql.drop_database(args.host, name)
-            removed += 1
-            time.sleep(2)
-            log_line(log, f"REMOVED {name} deal={deal_ids}")
+            precheck_err = precheck_network(host)
         except Exception as ex:
-            errors += 1
-            failed_names.append(name)
-            log_line(log, f"ERROR {name} deal={deal_ids}: {one_line(ex)}")
+            precheck_err = one_line(ex)
+        if precheck_err:
+            log_line(log, f"FAIL precheck {host}: {precheck_err}")
+            unreachable.append((engine, host, precheck_err))
+            continue
+        try:
+            databases = list_databases(clients[engine], engine, host)
+        except Exception as ex:
+            msg = one_line(ex)
+            log_line(log, f"FAIL {host} недоступен: {msg}")
+            unreachable.append((engine, host, msg))
+            continue
+        reachable.append((engine, host, deal_candidates(databases)))
+        remember(host, removed=0, errors=0, names=[], failed=[])
 
-    log_line(log, f"SUMMARY removed={removed} errors={errors}")
+    # Шаг 2: сделки Б24 один раз на все серверы.
+    all_ids = sorted({
+        deal_id
+        for _e, _h, candidates in reachable
+        for deal_id in deal_id_list(candidates)
+    })
+    deals = fetch_deals(all_ids) if all_ids else {}
 
-    if errors:
-        # Ошибки удаления — только лог и Windows-тост, без B24/Telegram.
-        emit_local("db-clean.fail",
-                   f"удалено {removed}, ошибок {errors}: "
-                   f"{banner_list(failed_names)}")
+    # Шаг 3: отбор кандидатов и удаление по серверам.
+    allow_missing = args.delete_missing or os.environ.get(
+        "DB_CLEAN_DELETE_MISSING") == "1"
+    for engine, host, candidates in reachable:
+        to_drop, skipped = collect_candidates(
+            candidates, deals, terminal, allow_missing=allow_missing,
+        )
+        reasons = {name: reason for name, _ids, reason in skipped}
+        for name in sorted(candidates):
+            deal_ids = candidates[name]
+            if name in reasons:
+                log_line(log,
+                         f"SKIPPED host={host} {name} deal={deal_ids} "
+                         f"{reasons[name]}")
+            else:
+                log_line(
+                    log,
+                    f"CANDIDATE host={host} {name} deal={deal_ids} "
+                    f"завершены: {deal_states(deals, deal_ids)}",
+                )
+
+        if args.limit > 0:
+            to_drop = to_drop[:args.limit]
+
+        names = [n for n, _ in to_drop]
+        summary = (
+            f"SUMMARY host={host} engine={engine} "
+            f"candidates={len(candidates)} to_drop={len(to_drop)} "
+            f"skipped={len(skipped)} dry_run={int(not commit)}"
+        )
+        log_line(log, summary)
+
+        if not commit:
+            if to_drop:
+                # Dry-run — не продакшн: без B24/Telegram.
+                emit_local(
+                    "db-clean.dryrun",
+                    f"{host}: к удалению {len(to_drop)} БД: "
+                    f"{banner_list(names)}",
+                )
+            # Нулевой dry-run — только лог/консоль, без сигнала/уведомления.
+            else:
+                log_line(log, f"DRYRUN host={host}: к удалению 0 БД")
+            print(summary)
+            for n, d in to_drop:
+                print(f"  would-drop [{host}] {n} (deal {d})")
+            remember(host, removed=0, errors=0, names=names, failed=[])
+            continue
+
+        removed = 0
+        errors = 0
+        failed_names: list[str] = []
+        for name, deal_ids in to_drop:
+            try:
+                drop_database(clients[engine], engine, host, name)
+                removed += 1
+                time.sleep(2)
+                log_line(log, f"REMOVED host={host} {name} deal={deal_ids}")
+            except Exception as ex:
+                errors += 1
+                failed_names.append(name)
+                log_line(log,
+                         f"ERROR host={host} {name} deal={deal_ids}: "
+                         f"{one_line(ex)}")
+
+        log_line(log, f"SUMMARY host={host} removed={removed} errors={errors}")
+        remember(host, removed=removed, errors=errors,
+                 names=names, failed=failed_names)
+
+        if errors:
+            # Ошибки удаления — только лог и Windows-тост, без B24/Telegram.
+            emit_local(
+                "db-clean.fail",
+                f"{host}: удалено {removed}, ошибок {errors}: "
+                f"{banner_list(failed_names)}",
+            )
+        elif removed:
+            log_line(log, f"OK host={host}: удалено {removed} БД")
+        else:
+            # Нулевой результат — только лог, без сигнала и уведомления.
+            log_line(log, f"OK host={host}: удалено 0 БД")
+
+    # Шаг 4: итог по всем серверам, retry, уведомления, соединения.
+    fail = False
+    if unreachable:
+        fail = True
         set_retry()
-    elif removed:
-        # Единственная продакшн-ветка: B24/Telegram (+ Windows-тост внутри emit).
-        emit("db-clean.ok",
-             f"aisql server очищен, удалены бд: {banner_list(names)}")
+        if os.environ.get("DB_CLEAN_RETRY") != "1":
+            for _engine, host, msg in unreachable:
+                # FAIL — только лог и Windows-тост, без B24/Telegram.
+                emit_local("db-clean.fail", f"{host} недоступен: {msg}")
+
+    total_removed = sum(st["removed"] for st in stats.values())
+    total_errors = sum(st["errors"] for st in stats.values())
+    if total_errors:
+        fail = True
+        set_retry()
+    elif unreachable:
+        # Недоступный сервер: маркер уже поднят — не сбрасываем его и не
+        # шлём ok, чтобы retry-демон переподнял пропущенный сервер.
+        pass
+    elif total_removed:
         clear_retry()
+        # Продакшн-ветка: B24/Telegram (+ Windows-тост внутри emit).
+        emit("db-clean.ok", ok_message(stats))
     else:
-        # Нулевой результат — только лог, без сигнала и уведомления.
-        log_line(log, "OK пусто: удалено 0 БД")
         clear_retry()
 
-    try:
-        mssql.close_all()
-    except Exception:
-        pass
-    return 0
+    for engine in (ENGINE_MSSQL, ENGINE_PGSQL):
+        try:
+            clients[engine].close_all()
+        except Exception:
+            pass
+    return 2 if fail else 0
 
 
 if __name__ == "__main__":

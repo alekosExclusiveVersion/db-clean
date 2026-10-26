@@ -108,6 +108,16 @@ class DealCandidates(unittest.TestCase):
             {"client_1": [1], "base_93010": [93010], "firm_x_9": [9]},
         )
 
+    def test_excluded_prefixes_skip_candidates(self):
+        os.environ["DB_CLEAN_EXCLUDE_PREFIXES"] = "priem"
+        try:
+            self.assertEqual(
+                d.deal_candidates(["priem_514", "client_1"]),
+                {"client_1": [1]},
+            )
+        finally:
+            os.environ.pop("DB_CLEAN_EXCLUDE_PREFIXES", None)
+
     def test_ids_dedup_keep_order(self):
         candidates = {"a_1": [3, 1], "b_2": [1, 2], "c_3": [2]}
         self.assertEqual(d.deal_id_list(candidates), [3, 1, 2])
@@ -172,6 +182,31 @@ class CollectCandidates(unittest.TestCase):
         self.assertEqual(d.collect_candidates({}, {}, self.terminal), ([], []))
 
 
+class ParseHostList(unittest.TestCase):
+    def test_unset_returns_none(self):
+        self.assertIsNone(d.parse_host_list(None))
+
+    def test_empty_and_off_disable(self):
+        self.assertEqual(d.parse_host_list(""), [])
+        self.assertEqual(d.parse_host_list(" off "), [])
+        self.assertEqual(d.parse_host_list("none"), [])
+        self.assertEqual(d.parse_host_list("0"), [])
+
+    def test_parse_list_with_ports(self):
+        self.assertEqual(
+            d.parse_host_list("pg-sup.tradesoft.corp:45432, other.host"),
+            ["pg-sup.tradesoft.corp:45432", "other.host"],
+        )
+
+
+class EngineListSql(unittest.TestCase):
+    def test_pgsql_uses_pg_database(self):
+        self.assertIn("pg_database", d.engine_list_sql(d.ENGINE_PGSQL))
+
+    def test_mssql_uses_sys_databases(self):
+        self.assertIn("sys.databases", d.engine_list_sql(d.ENGINE_MSSQL))
+
+
 class BannerList(unittest.TestCase):
     def test_short_list_joined(self):
         self.assertEqual(d.banner_list(["a", "b"]), "a, b")
@@ -184,6 +219,39 @@ class BannerList(unittest.TestCase):
 
     def test_one_line(self):
         self.assertEqual(d.one_line("a\r\n  b\tc"), "a b c")
+
+
+class OkMessage(unittest.TestCase):
+    def setUp(self):
+        self.stats = {
+            "pg-sup.tradesoft.corp:5432": {
+                "removed": 2, "errors": 0,
+                "names": ["detaliym_114483", "favorit_110624"],
+                "failed": [],
+            },
+            "aisql.tradesoft.corp\\supportsql": {
+                "removed": 0, "errors": 0, "names": [], "failed": [],
+            },
+        }
+
+    def test_checkmark_and_bullets_per_server(self):
+        msg = d.ok_message(self.stats)
+        self.assertTrue(msg.startswith("✅ Очистка БД выполнена"))
+        self.assertIn("pg-sup.tradesoft.corp:5432:", msg)
+        self.assertIn("• detaliym_114483", msg)
+        self.assertIn("• favorit_110624", msg)
+
+    def test_server_without_removals_omitted(self):
+        msg = d.ok_message(self.stats)
+        self.assertNotIn("aisql.tradesoft.corp", msg)
+
+    def test_long_list_truncates(self):
+        self.stats["pg-sup.tradesoft.corp:5432"]["names"] = [
+            f"a_{i}" for i in range(1, 9)
+        ]
+        msg = d.ok_message(self.stats)
+        self.assertNotIn("a_7", msg)
+        self.assertIn("• … и ещё 2", msg)
 
 
 class PrecheckNetwork(unittest.TestCase):
@@ -199,6 +267,13 @@ class PrecheckNetwork(unittest.TestCase):
         err = d.precheck_network(r"nonexistent-host-xyz123.invalid\supportsql")
         self.assertIsNotNone(err)
         self.assertIn("DNS", err)
+
+    def test_pgsql_host_with_port_strips_port(self):
+        os.environ.pop("DB_CLEAN_SKIP_PRECHECK", None)
+        err = d.precheck_network("nonexistent-host-xyz123.invalid:5432")
+        self.assertIsNotNone(err)
+        self.assertIn("nonexistent-host-xyz123.invalid", err)
+        self.assertNotIn(":5432", err)
 
 
 if __name__ == "__main__":
