@@ -253,6 +253,15 @@ class OkMessage(unittest.TestCase):
         self.assertNotIn("a_7", msg)
         self.assertIn("• … и ещё 2", msg)
 
+    def test_sizes_in_parentheses(self):
+        self.stats["pg-sup.tradesoft.corp:5432"]["sizes"] = {
+            "detaliym_114483": "123.4 МБ",
+            "favorit_110624": "56.7 МБ",
+        }
+        msg = d.ok_message(self.stats)
+        self.assertIn("• detaliym_114483 (123.4 МБ)", msg)
+        self.assertIn("• favorit_110624 (56.7 МБ)", msg)
+
 
 class PrecheckNetwork(unittest.TestCase):
     def tearDown(self):

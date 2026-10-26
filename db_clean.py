@@ -169,15 +169,28 @@ def banner_list(names: list[str]) -> str:
     return ", ".join(head) + f", и ещё {len(names) - BANNER_MAX_NAMES}"
 
 
+def fmt_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} Б"
+    if num_bytes < 1024 ** 2:
+        return f"{num_bytes / 1024:.1f} КБ"
+    if num_bytes < 1024 ** 3:
+        return f"{num_bytes / 1024 ** 2:.1f} МБ"
+    return f"{num_bytes / 1024 ** 3:.1f} ГБ"
+
+
 def ok_message(stats: dict[str, dict]) -> str:
-    """Ok-уведомление: ✅ и списком удалённые БД под каждым сервером."""
+    """Ok-уведомление: ✅, размер БД в скобках и список под каждым сервером."""
     lines = ["✅ Очистка БД выполнена"]
     for host, st in stats.items():
         if not st["removed"]:
             continue
         lines.append(f"{host}:")
+        sizes = st.get("sizes") or {}
         shown = st["names"][:BANNER_MAX_NAMES]
-        lines.extend(f"• {name}" for name in shown)
+        for name in shown:
+            size = sizes.get(name)
+            lines.append(f"• {name} ({size})" if size else f"• {name}")
         if len(st["names"]) > BANNER_MAX_NAMES:
             lines.append(f"• … и ещё {len(st['names']) - BANNER_MAX_NAMES}")
     return "\n".join(lines)
@@ -528,9 +541,10 @@ def main() -> int:
     stats: dict[str, dict] = {}
 
     def remember(host: str, *, removed: int, errors: int, names: list[str],
-                 failed: list[str]) -> None:
+                 failed: list[str], sizes: dict[str, str] | None = None) -> None:
         stats[host] = {"removed": removed, "errors": errors,
-                       "names": names, "failed": failed}
+                       "names": names, "failed": failed,
+                       "sizes": sizes or {}}
 
     load_psa()
     try:
@@ -653,8 +667,14 @@ def main() -> int:
                          f"{one_line(ex)}")
 
         log_line(log, f"SUMMARY host={host} removed={removed} errors={errors}")
-        remember(host, removed=removed, errors=errors,
-                 names=names, failed=failed_names)
+
+        sizes: dict[str, str] = {}
+        for n in names:
+            raw_sizes = clients[engine].database_sizes(host) or {}
+            if n in raw_sizes:
+                sizes[n] = fmt_size(int(raw_sizes[n] or 0))
+        remember(host, removed=removed, errors=errors, names=names,
+                 failed=failed_names, sizes=sizes)
 
         if errors:
             # Ошибки удаления — только лог и Windows-тост, без B24/Telegram.
