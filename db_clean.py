@@ -17,7 +17,9 @@ corp-db-clean-retry каждые 15 мин повторяет очистку, п
 реестра PSA (движок pgsql; список переопределяется env
 DB_CLEAN_PGSQL_HOSTS через запятую, формат host[:port]).
 
-Режимы: --dry-run (по умолчанию) показывает кандидатов, --commit удаляет.
+Режимы: --dry-run (по умолчанию) показывает кандидатов, --commit удаляет,
+--sweep очищает файлы логов (журнал) у всех найденных БД без удаления,
+--sweep-dry-run — только список БД для очистки (без выполнения).
 Уведомления: в B24/Telegram уходит только фактическое удаление БД
 (db-clean.ok с removed>0); FAIL/dryrun/нули — в лог и Windows-тост.
 """
@@ -344,6 +346,22 @@ def drop_database(client, engine: str, host: str, name: str) -> None:
         conn.close()
 
 
+def clean_database_logs(client, engine: str, host: str, name: str) -> bool:
+    """Очищает файлы логов (журнал транзакций/данных) БД.
+
+    - mssql: DBCC SHRINKFILE — RECOVERY SIMPLE → SHRINKFILE(2,0) → RECOVERY FULL.
+    - pgsql: VACUUM FULL — пересборка физических файлов данных (autocommit).
+
+    Возвращает True, если очистка завершилась успешно (иначе исключение).
+    Вызывается sweep'ом; перед удалением (DROP удаляет файлы целиком) не нужна.
+    """
+    if engine == ENGINE_PGSQL:
+        client.vacuum_full(host, name)
+        return True
+    client.shrink_log(host, name)
+    return True
+
+
 def engine_list_sql(engine: str) -> str:
     if engine == ENGINE_PGSQL:
         return "SELECT datname AS name FROM pg_database"
@@ -353,6 +371,47 @@ def engine_list_sql(engine: str) -> str:
 def list_databases(client, engine: str, host: str) -> list[str]:
     rows = client.query(host, engine_list_sql(engine))
     return sorted(r.get("name") for r in rows if r.get("name"))
+
+
+def plan_sweep(client, engine: str, host: str) -> list[tuple[str, str]]:
+    """Планирует очистку: [(name, size_str)] для всех нематериальных БД.
+
+    Размер — до очистки, в человекочитаемом виде; системные БД пропускаются.
+    """
+    databases = list_databases(client, engine, host)
+    sizes = client.database_sizes(host) or {}
+    return [
+        (n, fmt_size(int(sizes[n] or 0)) if n in sizes else "")
+        for n in databases
+        if n not in SYSTEM_DBS
+    ]
+
+
+def sweep_logs(client, engine: str, host: str, log: Path) -> list[tuple[str, str]]:
+    """Очищает файлы логов (журнал) у всех найденных БД сервера (без удаления).
+
+    Возвращает [(name, size_str)] очищенных БД (размер — до очистки, в
+    человекочитаемом виде); системные БД пропускаются.
+    """
+    cleaned: list[tuple[str, str]] = []
+    for name, size_str in plan_sweep(client, engine, host):
+        clean_database_logs(client, engine, host, name)
+        cleaned.append((name, size_str))
+        log_line(log, f"SWEEP_LOGS host={host} {name} ok")
+    return cleaned
+
+
+def sweep_message(cleaned: dict[str, list[tuple[str, str]]]) -> str:
+    """Сообщение об уведомлении по результату sweep: очищенные БД + объёмы."""
+    lines = ["🧹 Очистка файлов логов завершена"]
+    for host, entries in sorted(cleaned.items()):
+        lines.append(f"{host}:")
+        shown = entries[:BANNER_MAX_NAMES]
+        for name, size in shown:
+            lines.append(f"• {name} ({size})" if size else f"• {name}")
+        if len(entries) > BANNER_MAX_NAMES:
+            lines.append(f"• … и ещё {len(entries) - BANNER_MAX_NAMES}")
+    return "\n".join(lines)
 
 
 def parse_candidate(name: str) -> list[int] | None:
@@ -514,6 +573,12 @@ def main() -> int:
     ap.add_argument("--delete-missing", action="store_true",
                     help="удалять БД, чьи сделки не найдены в Б24 "
                          "(вместо fail-closed пропуска)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="очистить файлы логов (журнал) у всех найденных БД "
+                         "на всех серверах; без удаления")
+    ap.add_argument("--sweep-dry-run", action="store_true",
+                    help="dry-run для --sweep: только список БД для очистки, "
+                         "без выполнения очистки")
     args = ap.parse_args()
 
     terminal = terminal_semantics(args.only_success)
@@ -592,6 +657,28 @@ def main() -> int:
             continue
         reachable.append((engine, host, deal_candidates(databases)))
         remember(host, removed=0, errors=0, names=[], failed=[])
+
+    # Шаг 1.5: sweep — очистка файлов логов у всех найденных БД (без удаления).
+    if args.sweep or args.sweep_dry_run:
+        sweep_cleaned: dict[str, list[tuple[str, str]]] = {}
+        for engine, host, _candidates in reachable:
+            try:
+                if args.sweep_dry_run:
+                    sweep_cleaned[host] = plan_sweep(clients[engine], engine, host)
+                else:
+                    sweep_cleaned[host] = sweep_logs(clients[engine], engine, host, log)
+            except Exception as ex:
+                log_line(log, f"SWEEP_FAIL host={host}: {one_line(ex)}")
+                continue
+        if args.sweep_dry_run:
+            for host, entries in sorted(sweep_cleaned.items()):
+                if not entries:
+                    continue
+                print(f"{host}: к очистке {len(entries)} БД")
+                for name, size in entries:
+                    print(f"  would-sweep {host} {name} ({size})")
+        elif sweep_cleaned:
+            emit("db-clean.sweep", sweep_message(sweep_cleaned))
 
     # Шаг 2: сделки Б24 один раз на все серверы.
     all_ids = sorted({

@@ -263,6 +263,82 @@ class OkMessage(unittest.TestCase):
         self.assertIn("• favorit_110624 (56.7 МБ)", msg)
 
 
+class CleanDatabaseLogs(unittest.TestCase):
+    def test_pgsql_dispatches_vacuum_full(self):
+        calls = []
+
+        class FakePgsql:
+            def vacuum_full(self, host, database):
+                calls.append(("vacuum_full", host, database))
+
+        ok = d.clean_database_logs(FakePgsql(), d.ENGINE_PGSQL, "pg-sup:5432", "client_1")
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("vacuum_full", "pg-sup:5432", "client_1")])
+
+    def test_mssql_dispatches_shrink_log(self):
+        calls = []
+
+        class FakeMssql:
+            def shrink_log(self, host, database):
+                calls.append(("shrink_log", host, database))
+
+        ok = d.clean_database_logs(FakeMssql(), d.ENGINE_MSSQL, "aisql", "client_1")
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("shrink_log", "aisql", "client_1")])
+
+
+class SweepLogs(unittest.TestCase):
+    def _client(self):
+        cleaned = []
+
+        class FakeClient:
+            def query(self, host, sql, database=None, params=None):
+                return [{"name": n} for n in ("client_1", "master")]
+
+            def database_sizes(self, host):
+                return {"client_1": 123456}
+
+            def vacuum_full(self, host, database):
+                cleaned.append((host, database))
+
+            def shrink_log(self, host, database):
+                cleaned.append((host, database))
+
+        self.cleaned = cleaned
+        return FakeClient()
+
+    def test_sweep_cleans_non_system_dbs(self):
+        client = self._client()
+        cleaned = d.sweep_logs(client, d.ENGINE_PGSQL, "pg-sup:5432", Path("/tmp/x.log"))
+        self.assertEqual(cleaned, [("client_1", "120.6 КБ")])
+        self.assertEqual(self.cleaned, [("pg-sup:5432", "client_1")])
+
+    def test_sweep_mssql_cleans_via_shrink_log(self):
+        client = self._client()
+        cleaned = d.sweep_logs(client, d.ENGINE_MSSQL, "aisql", Path("/tmp/x.log"))
+        self.assertEqual(cleaned, [("client_1", "120.6 КБ")])
+        self.assertEqual(self.cleaned, [("aisql", "client_1")])
+
+    def test_plan_sweep_lists_non_system_dbs_with_sizes(self):
+        client = self._client()
+        planned = d.plan_sweep(client, d.ENGINE_PGSQL, "pg-sup:5432")
+        self.assertEqual(planned, [("client_1", "120.6 КБ")])
+
+
+class SweepMessage(unittest.TestCase):
+    def test_sweep_message_lists_cleaned_per_host_with_sizes(self):
+        msg = d.sweep_message({
+            "pg-sup.tradesoft.corp:5432": [("client_1", "120.6 КБ")],
+            "aisql.tradesoft.corp\\supportsql": [("client_2", ""), ("client_3", "56.7 МБ")],
+        })
+        self.assertTrue(msg.startswith("🧹 Очистка файлов логов завершена"))
+        self.assertIn("pg-sup.tradesoft.corp:5432:", msg)
+        self.assertIn("• client_1 (120.6 КБ)", msg)
+        self.assertIn("aisql.tradesoft.corp\\supportsql:", msg)
+        self.assertIn("• client_2", msg)
+        self.assertIn("• client_3 (56.7 МБ)", msg)
+
+
 class PrecheckNetwork(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("DB_CLEAN_SKIP_PRECHECK", None)
